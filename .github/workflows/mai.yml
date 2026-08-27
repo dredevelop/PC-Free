@@ -1,0 +1,623 @@
+name: Linux KDE Plasma Wayland RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kde-wayland-rdp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3600
+
+    env:
+      RDP_USER: RDP
+
+    steps:
+
+      # ============================================================
+      # 1. Atualizar sistema
+      # ============================================================
+      - name: Update Ubuntu
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+      # ============================================================
+      # 2. Instalar KDE Plasma + Wayland + KRDP
+      # ============================================================
+      - name: Install KDE Plasma Wayland
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            kde-plasma-desktop \
+            plasma-workspace-wayland \
+            kwin-wayland \
+            sddm \
+            dbus-user-session \
+            dbus-x11 \
+            xdg-desktop-portal \
+            xdg-desktop-portal-kde \
+            openssl \
+            curl \
+            wget \
+            netcat-openbsd \
+            mesa-utils
+
+          echo "KDE/Wayland instalado."
+
+          echo
+          echo "Plasma:"
+          plasmashell --version || true
+
+          echo
+          echo "KWin:"
+          kwin_wayland --version || true
+
+          echo
+          echo "Wayland:"
+          ls -l /usr/share/wayland-sessions/ || true
+
+      # ============================================================
+      # 3. Procurar KRDP
+      # ============================================================
+      - name: Install/Locate KRDP
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Procurando krdpserver..."
+
+          if command -v krdpserver >/dev/null 2>&1; then
+            echo "krdpserver encontrado:"
+            command -v krdpserver
+            krdpserver --help || true
+            exit 0
+          fi
+
+          echo "krdpserver não está disponível diretamente."
+
+          echo
+          echo "Pacotes relacionados:"
+          apt-cache search krdp || true
+
+          echo
+          echo "Procurando binário:"
+          find /usr -type f -name 'krdpserver' 2>/dev/null || true
+
+      # ============================================================
+      # 4. Criar usuário RDP
+      # ============================================================
+      - name: Create RDP User
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          USERNAME="$RDP_USER"
+
+          PASSWORD="$(python3 - <<'PY'
+          import secrets
+          import string
+
+          alphabet = string.ascii_letters + string.digits + "!@#$%^&*_-+="
+
+          while True:
+              password = ''.join(
+                  secrets.choice(alphabet)
+                  for _ in range(32)
+              )
+
+              if (
+                  any(c.isupper() for c in password)
+                  and any(c.islower() for c in password)
+                  and any(c.isdigit() for c in password)
+                  and any(c in "!@#$%^&*_-+=" for c in password)
+              ):
+                  print(password)
+                  break
+          PY
+          )"
+
+          if id "$USERNAME" >/dev/null 2>&1; then
+              sudo userdel -r "$USERNAME" || true
+          fi
+
+          sudo useradd \
+            --create-home \
+            --shell /bin/bash \
+            "$USERNAME"
+
+          echo "$USERNAME:$PASSWORD" | sudo chpasswd
+
+          # Permissões administrativas
+          sudo usermod -aG sudo "$USERNAME"
+
+          echo "RDP_USERNAME=$USERNAME" >> "$GITHUB_ENV"
+          echo "RDP_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+
+          echo "Usuário criado."
+
+      # ============================================================
+      # 5. Configurar sessão Plasma Wayland
+      # ============================================================
+      - name: Configure Plasma Wayland
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          USERNAME="$RDP_USER"
+          HOME_DIR="/home/$USERNAME"
+
+          sudo mkdir -p "$HOME_DIR/.config"
+
+          sudo tee "$HOME_DIR/.profile" > /dev/null <<'EOF'
+          export XDG_CURRENT_DESKTOP=KDE
+          export XDG_SESSION_DESKTOP=KDE
+          export DESKTOP_SESSION=plasma
+          export KDE_FULL_SESSION=true
+          EOF
+
+          sudo chown "$USERNAME:$USERNAME" \
+            "$HOME_DIR/.profile"
+
+          # Configura Plasma como sessão Wayland
+          sudo tee "$HOME_DIR/.xsessionrc" > /dev/null <<'EOF'
+          export XDG_CURRENT_DESKTOP=KDE
+          export XDG_SESSION_DESKTOP=KDE
+          export DESKTOP_SESSION=plasma
+          EOF
+
+          sudo chown "$USERNAME:$USERNAME" \
+            "$HOME_DIR/.xsessionrc"
+
+      # ============================================================
+      # 6. Configurar SDDM para autologin
+      #
+      # KRDP compartilha a sessão Plasma existente.
+      # ============================================================
+      - name: Configure SDDM Autologin
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo mkdir -p /etc/sddm.conf.d
+
+          sudo tee /etc/sddm.conf.d/kde-wayland.conf > /dev/null <<EOF
+          [Autologin]
+          User=$RDP_USER
+          Relogin=true
+
+          [General]
+          DisplayServer=wayland
+
+          [Wayland]
+          CompositorCommand=kwin_wayland
+          EOF
+
+          echo "SDDM configurado."
+
+      # ============================================================
+      # 7. Configurar Tailscale
+      # ============================================================
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          sudo systemctl enable --now tailscaled
+
+          tailscale version
+
+      # ============================================================
+      # 8. Conectar ao Tailscale
+      # ============================================================
+      - name: Connect Tailscale
+        shell: bash
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euxo pipefail
+
+          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+            echo "ERRO: TAILSCALE_AUTH_KEY não configurada."
+            exit 1
+          fi
+
+          HOSTNAME="gh-kde-wayland-${GITHUB_RUN_ID}"
+
+          sudo tailscale up \
+            --auth-key="$TAILSCALE_AUTH_KEY" \
+            --hostname="$HOSTNAME"
+
+          echo "Aguardando endereço Tailscale..."
+
+          TAILSCALE_IP=""
+
+          for i in $(seq 1 30); do
+
+            TAILSCALE_IP="$(
+              tailscale ip -4 2>/dev/null |
+              head -n 1 |
+              tr -d '\r'
+            )"
+
+            if [ -n "$TAILSCALE_IP" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "Não foi possível obter IP Tailscale."
+            tailscale status || true
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
+
+          echo
+          echo "======================================"
+          echo "Tailscale conectado"
+          echo "Hostname: $HOSTNAME"
+          echo "IP:       $TAILSCALE_IP"
+          echo "======================================"
+
+      # ============================================================
+      # 9. Certificado TLS para KRDP
+      # ============================================================
+      - name: Generate KRDP Certificate
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          USERNAME="$RDP_USER"
+          HOME_DIR="/home/$USERNAME"
+
+          sudo -u "$USERNAME" mkdir -p \
+            "$HOME_DIR/.local/share/krdpserver"
+
+          sudo -u "$USERNAME" openssl req \
+            -nodes \
+            -new \
+            -x509 \
+            -days 1 \
+            -batch \
+            -newkey rsa:2048 \
+            -keyout "$HOME_DIR/.local/share/krdpserver/krdp.key" \
+            -out "$HOME_DIR/.local/share/krdpserver/krdp.crt" \
+            -subj "/CN=$TAILSCALE_IP"
+
+          sudo chown -R "$USERNAME:$USERNAME" \
+            "$HOME_DIR/.local/share/krdpserver"
+
+          sudo chmod 600 \
+            "$HOME_DIR/.local/share/krdpserver/krdp.key"
+
+      # ============================================================
+      # 10. Configurar KRDP
+      # ============================================================
+      - name: Configure KRDP
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          USERNAME="$RDP_USER"
+          HOME_DIR="/home/$USERNAME"
+
+          CERT="$HOME_DIR/.local/share/krdpserver/krdp.crt"
+          KEY="$HOME_DIR/.local/share/krdpserver/krdp.key"
+
+          sudo -u "$USERNAME" \
+            kwriteconfig6 \
+            --file "$HOME_DIR/.config/krdpserverrc" \
+            --group General \
+            --key Certificate \
+            "$CERT"
+
+          sudo -u "$USERNAME" \
+            kwriteconfig6 \
+            --file "$HOME_DIR/.config/krdpserverrc" \
+            --group General \
+            --key CertificateKey \
+            "$KEY"
+
+          sudo -u "$USERNAME" \
+            kwriteconfig6 \
+            --file "$HOME_DIR/.config/krdpserverrc" \
+            --group General \
+            --key SystemUserEnabled \
+            true
+
+          sudo -u "$USERNAME" \
+            kwriteconfig6 \
+            --file "$HOME_DIR/.config/krdpserverrc" \
+            --group General \
+            --key MonitorMode \
+            workspace
+
+          sudo -u "$USERNAME" \
+            kwriteconfig6 \
+            --file "$HOME_DIR/.config/krdpserverrc" \
+            --group General \
+            --key MonitorIndex \
+            0
+
+          echo "KRDP configurado."
+
+      # ============================================================
+      # 11. Firewall
+      # ============================================================
+      - name: Configure Firewall
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get install -y ufw
+
+          sudo ufw --force reset
+
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+
+          # RDP SOMENTE através do Tailscale
+          sudo ufw allow in on tailscale0 \
+            to any port 3389 \
+            proto tcp
+
+          sudo ufw --force enable
+
+          sudo ufw status verbose
+
+      # ============================================================
+      # 12. Iniciar SDDM / Plasma Wayland
+      # ============================================================
+      - name: Start KDE Plasma Wayland
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo systemctl enable sddm
+
+          # Tenta iniciar o display manager.
+          sudo systemctl restart sddm
+
+          echo "Aguardando sessão KDE..."
+
+          for i in $(seq 1 60); do
+
+            if pgrep -u "$RDP_USER" -f "startplasma-wayland" >/dev/null 2>&1; then
+              echo "Plasma Wayland detectado."
+              break
+            fi
+
+            if pgrep -u "$RDP_USER" -f "kwin_wayland" >/dev/null 2>&1; then
+              echo "KWin Wayland detectado."
+              break
+            fi
+
+            sleep 2
+          done
+
+          echo
+          echo "Processos KDE:"
+          ps aux | grep -E \
+            'startplasma-wayland|kwin_wayland|plasmashell' \
+            | grep -v grep || true
+
+      # ============================================================
+      # 13. Iniciar KRDP
+      # ============================================================
+      - name: Start KRDP Server
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          USERNAME="$RDP_USER"
+
+          echo "Procurando serviço KRDP..."
+
+          if sudo -u "$USERNAME" \
+             systemctl --user list-unit-files \
+             | grep -q 'app-org.kde.krdpserver.service'; then
+
+              echo "Serviço KRDP encontrado."
+
+              sudo -u "$USERNAME" \
+                systemctl --user enable --now \
+                app-org.kde.krdpserver.service
+
+              sleep 5
+
+          elif command -v krdpserver >/dev/null 2>&1; then
+
+              echo "Executável krdpserver encontrado."
+
+              sudo -u "$USERNAME" \
+                bash -c "
+                  krdpserver \
+                    --address '$TAILSCALE_IP' \
+                    --port 3389 \
+                    --certificate '$HOME/.local/share/krdpserver/krdp.crt' \
+                    --certificate-key '$HOME/.local/share/krdpserver/krdp.key' \
+                    --virtual-monitor 1920x1080@1
+                " &
+
+              echo $! > /tmp/krdpserver.pid
+
+          else
+
+              echo
+              echo "=========================================="
+              echo "ERRO: KRDP NÃO ENCONTRADO"
+              echo "=========================================="
+              echo
+              echo "Ubuntu 24.04 não disponibilizou um"
+              echo "krdpserver utilizável nesse runner."
+              echo
+              echo "Pacotes:"
+              apt-cache search krdp || true
+              echo
+              echo "Binários:"
+              find /usr -name krdpserver 2>/dev/null || true
+              echo
+
+              exit 1
+          fi
+
+      # ============================================================
+      # 14. Verificar Wayland
+      # ============================================================
+      - name: Verify Wayland
+        shell: bash
+        run: |
+          echo
+          echo "======================================"
+          echo "VERIFICAÇÃO DA SESSÃO"
+          echo "======================================"
+
+          sudo -u "$RDP_USER" \
+            loginctl list-sessions || true
+
+          echo
+          echo "Processos Plasma:"
+
+          ps aux | grep -E \
+            'kwin_wayland|startplasma-wayland|plasmashell' \
+            | grep -v grep || true
+
+          echo
+          echo "Display sessions:"
+
+          loginctl show-user "$RDP_USER" 2>/dev/null || true
+
+      # ============================================================
+      # 15. Verificar porta RDP
+      # ============================================================
+      - name: Verify RDP Port
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Testando $TAILSCALE_IP:3389..."
+
+          for i in $(seq 1 15); do
+
+            if nc -z -w 5 "$TAILSCALE_IP" 3389; then
+
+              echo
+              echo "======================================"
+              echo "RDP ONLINE"
+              echo "======================================"
+
+              exit 0
+            fi
+
+            echo "Tentativa $i..."
+            sleep 3
+
+          done
+
+          echo
+          echo "KRDP não está escutando na porta 3389."
+
+          echo
+          echo "Sockets:"
+          sudo ss -lntp || true
+
+          echo
+          echo "KRDP service:"
+          sudo -u "$RDP_USER" \
+            systemctl --user status \
+            app-org.kde.krdpserver.service \
+            --no-pager || true
+
+          echo
+          echo "KRDP logs:"
+          sudo -u "$RDP_USER" \
+            journalctl --user \
+            -u app-org.kde.krdpserver.service \
+            --no-pager \
+            -n 100 || true
+
+          exit 1
+
+      # ============================================================
+      # 16. Informações de acesso
+      # ============================================================
+      - name: Show RDP Information
+        shell: bash
+        run: |
+          echo
+          echo "================================================"
+          echo "       KDE PLASMA WAYLAND - RDP"
+          echo "================================================"
+          echo
+          echo "Sistema : Ubuntu 24.04"
+          echo "Desktop : KDE Plasma"
+          echo "Display : Wayland"
+          echo "Server  : KRDP"
+          echo
+          echo "Endereço: $TAILSCALE_IP"
+          echo "Porta   : 3389"
+          echo "Usuário : $RDP_USERNAME"
+          echo "Senha   : $RDP_PASSWORD"
+          echo
+          echo "================================================"
+          echo
+          echo "No Windows:"
+          echo
+          echo "mstsc.exe"
+          echo
+          echo "Endereço:"
+          echo "$TAILSCALE_IP:3389"
+          echo
+          echo "================================================"
+
+      # ============================================================
+      # 17. Manter runner vivo
+      # ============================================================
+      - name: Keep RDP Alive
+        shell: bash
+        run: |
+          echo
+          echo "======================================"
+          echo " KDE WAYLAND RDP ATIVO"
+          echo "======================================"
+          echo "IP: $TAILSCALE_IP"
+          echo "======================================"
+
+          while true; do
+
+            echo
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]"
+
+            echo "Tailscale:"
+            tailscale status | head -n 10 || true
+
+            echo
+            echo "KDE:"
+            pgrep -u "$RDP_USER" \
+              -af 'kwin_wayland|plasmashell|startplasma-wayland' \
+              || true
+
+            echo
+            echo "RDP:"
+            sudo ss -lntp | grep ':3389' || true
+
+            echo
+            echo "KRDP:"
+            sudo -u "$RDP_USER" \
+              systemctl --user is-active \
+              app-org.kde.krdpserver.service \
+              2>/dev/null || true
+
+            sleep 300
+
+          done
